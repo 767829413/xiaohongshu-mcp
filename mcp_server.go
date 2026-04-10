@@ -339,6 +339,22 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
+	// 工具: 获取当前登录用户主页（无需 user_id / xsec_token）
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "my_profile",
+			Description: "获取当前登录用户的主页信息（用户名、关注/粉丝/获赞数、自己的帖子列表）。不需要任何参数，通过侧边栏自动导航。查看「我的帖子」时优先使用此工具。",
+			Annotations: &mcp.ToolAnnotations{
+				Title:        "My Profile",
+				ReadOnlyHint: true,
+			},
+		},
+		withPanicRecovery("my_profile", func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleMyProfile(ctx)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
 	// 工具 8: 获取用户主页
 	mcp.AddTool(server,
 		&mcp.Tool{
@@ -477,7 +493,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
-	logrus.Infof("Registered %d MCP tools", 15)
+	logrus.Infof("Registered %d MCP tools", 16)
 }
 
 // convertToMCPResult 将自定义的 MCPToolResult 转换为官方 SDK 的格式
