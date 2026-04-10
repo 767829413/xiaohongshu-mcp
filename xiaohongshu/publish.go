@@ -213,6 +213,10 @@ func uploadImages(page *rod.Page, imagesPaths []string) error {
 		logrus.Infof("获取有效图片：%s", path)
 	}
 
+	if len(validPaths) == 0 {
+		return errors.New("没有有效的图片文件可上传")
+	}
+
 	// 逐张上传：每张上传后等待预览出现，再上传下一张
 	for i, path := range validPaths {
 		selector := `input[type="file"]`
@@ -338,10 +342,13 @@ func submitPublish(page *rod.Page, title, content string, tags []string, schedul
 		return errors.Wrap(err, "绑定商品失败")
 	}
 
-	submitButton, err := page.Element(".publish-page-publish-btn button.bg-red")
+	slog.Info("准备查找发布按钮")
+	shortPage := page.Timeout(30 * time.Second)
+	submitButton, err := shortPage.Element(".publish-page-publish-btn button.bg-red")
 	if err != nil {
-		return errors.Wrap(err, "查找发布按钮失败")
+		return errors.Wrap(err, "查找发布按钮失败（30s超时），请检查图片是否上传成功、页面是否正常加载")
 	}
+	slog.Info("找到发布按钮，准备点击")
 	if err := submitButton.Click(proto.InputMouseButtonLeft, 1); err != nil {
 		return errors.Wrap(err, "点击发布按钮失败")
 	}

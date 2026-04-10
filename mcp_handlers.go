@@ -120,6 +120,61 @@ func (s *AppServer) handleDeleteCookies(ctx context.Context) *MCPToolResult {
 	}
 }
 
+// handleSetCookies 接受 JSON cookie 字符串并持久化，用于从浏览器导入 session
+func (s *AppServer) handleSetCookies(ctx context.Context, cookiesJSON string) *MCPToolResult {
+	logrus.Info("MCP: 设置 cookies")
+
+	if cookiesJSON == "" {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "cookies 参数不能为空"}},
+			IsError: true,
+		}
+	}
+
+	if !json.Valid([]byte(cookiesJSON)) {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "cookies 格式不合法，需要有效的 JSON 数组"}},
+			IsError: true,
+		}
+	}
+
+	cookieLoader := cookies.NewLoadCookie(cookies.GetCookiesFilePath())
+	if err := cookieLoader.SaveCookies([]byte(cookiesJSON)); err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "保存 cookies 失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	return &MCPToolResult{
+		Content: []MCPContent{{
+			Type: "text",
+			Text: fmt.Sprintf("Cookies 已更新并保存到 %s\n\n下次浏览器操作将使用新 cookies。建议调用 check_login_status 验证登录状态。", cookies.GetCookiesFilePath()),
+		}},
+	}
+}
+
+// handleGetCookies 返回当前持久化的 cookies JSON（用于备份/调试）
+func (s *AppServer) handleGetCookies(ctx context.Context) *MCPToolResult {
+	logrus.Info("MCP: 获取 cookies")
+
+	cookieLoader := cookies.NewLoadCookie(cookies.GetCookiesFilePath())
+	data, err := cookieLoader.LoadCookies()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "读取 cookies 失败（可能尚未登录）: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	return &MCPToolResult{
+		Content: []MCPContent{{
+			Type: "text",
+			Text: string(data),
+		}},
+	}
+}
+
 // handlePublishContent 处理发布内容
 func (s *AppServer) handlePublishContent(ctx context.Context, args map[string]interface{}) *MCPToolResult {
 	logrus.Info("MCP: 发布内容")

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -246,6 +247,8 @@ func (s *XiaohongshuService) processImages(images []string) ([]string, error) {
 
 // publishContent 执行内容发布
 func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohongshu.PublishImageContent) error {
+	defer cleanupImages(content.ImagePaths)
+
 	b := newBrowser()
 	defer b.Close()
 
@@ -257,8 +260,22 @@ func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohon
 		return err
 	}
 
-	// 执行发布
 	return action.Publish(ctx, content)
+}
+
+// cleanupImages removes downloaded temp images after publish to prevent disk buildup.
+func cleanupImages(paths []string) {
+	imagesDir := configs.GetImagesPath()
+	for _, p := range paths {
+		if !strings.HasPrefix(p, imagesDir) {
+			continue
+		}
+		if err := os.Remove(p); err != nil {
+			logrus.Warnf("清理临时图片失败: %s, %v", p, err)
+		} else {
+			logrus.Infof("已清理临时图片: %s", p)
+		}
+	}
 }
 
 // PublishVideo 发布视频（本地文件）

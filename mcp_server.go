@@ -201,6 +201,40 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
+	// 工具: 设置 cookies（从浏览器导入或恢复备份）
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "set_cookies",
+			Description: "设置/更新小红书 cookies（JSON 数组格式）。可从浏览器 DevTools 导出后直接传入，用于免扫码登录或恢复备份。",
+			Annotations: &mcp.ToolAnnotations{
+				Title:           "Set Cookies",
+				DestructiveHint: boolPtr(true),
+			},
+		},
+		withPanicRecovery("set_cookies", func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+			Cookies string `json:"cookies" jsonschema:"cookies JSON 数组字符串，格式与浏览器 DevTools 导出的 cookies 一致"`
+		}) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleSetCookies(ctx, args.Cookies)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	// 工具: 获取当前 cookies（备份/调试用）
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "get_cookies",
+			Description: "获取当前保存的小红书 cookies JSON，可用于备份或调试。",
+			Annotations: &mcp.ToolAnnotations{
+				Title:        "Get Cookies",
+				ReadOnlyHint: true,
+			},
+		},
+		withPanicRecovery("get_cookies", func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleGetCookies(ctx)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
 	// 工具 4: 发布内容
 	mcp.AddTool(server,
 		&mcp.Tool{
@@ -443,7 +477,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
-	logrus.Infof("Registered %d MCP tools", 13)
+	logrus.Infof("Registered %d MCP tools", 15)
 }
 
 // convertToMCPResult 将自定义的 MCPToolResult 转换为官方 SDK 的格式

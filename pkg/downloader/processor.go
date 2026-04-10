@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/xpzouying/xiaohongshu-mcp/configs"
 )
@@ -36,7 +37,9 @@ func (p *ImageProcessor) ProcessImages(images []string) ([]string, error) {
 			}
 			localPaths = append(localPaths, localPath)
 		} else {
-			// 本地路径直接使用
+			if _, err := os.Stat(image); err != nil {
+				return nil, fmt.Errorf("本地图片文件不存在: %s — 请直接传 HTTPS 图片 URL（如 https://images.unsplash.com/photo-xxx），MCP 服务器会自动下载，不要传本地文件路径", image)
+			}
 			localPaths = append(localPaths, image)
 		}
 	}

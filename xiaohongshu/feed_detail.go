@@ -104,6 +104,9 @@ func (f *FeedDetailAction) GetFeedDetailWithConfig(ctx context.Context, feedID, 
 	}
 	sleepRandom(1000, 1000)
 
+	if err := checkCookieValid(page, feedID); err != nil {
+		return nil, err
+	}
 	if err := checkPageAccessible(page); err != nil {
 		return nil, err
 	}
@@ -752,6 +755,23 @@ func checkEndContainer(page *rod.Page) bool {
 }
 
 // ========== 页面检查 ==========
+
+// checkCookieValid detects if the browser was redirected away from the target
+// page, which indicates expired cookies or an invalid xsec_token. Call this
+// after navigation + WaitDOMStable. expectedFragment should be a substring
+// that must appear in the URL (typically the feedID).
+func checkCookieValid(page *rod.Page, expectedFragment string) error {
+	res, err := page.Eval(`() => location.href`)
+	if err != nil {
+		return nil // can't check, proceed optimistically
+	}
+	u := res.Value.Str()
+	if expectedFragment != "" && !strings.Contains(u, expectedFragment) {
+		logrus.Warnf("页面被重定向: expected URL containing %q, got %s", expectedFragment, u)
+		return fmt.Errorf("Cookie 已过期或 xsec_token 失效（页面被重定向到 %s），请通过 xhs cookie-update 更新 cookie", u)
+	}
+	return nil
+}
 
 func checkPageAccessible(page *rod.Page) error {
 	time.Sleep(500 * time.Millisecond)

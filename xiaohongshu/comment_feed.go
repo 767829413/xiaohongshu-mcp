@@ -2,6 +2,7 @@ package xiaohongshu
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -22,18 +23,22 @@ func NewCommentFeedAction(page *rod.Page) *CommentFeedAction {
 
 // PostComment 发表评论到 Feed
 func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, content string) error {
-	// 不使用 Context(ctx)，避免继承外部 context 的超时
 	page := f.page.Timeout(60 * time.Second)
 
-	url := makeFeedDetailURL(feedID, xsecToken)
-	logrus.Infof("打开 feed 详情页: %s", url)
+	pageURL := makeFeedDetailURL(feedID, xsecToken)
+	logrus.Infof("打开 feed 详情页: %s", pageURL)
 
-	// 导航到详情页
-	page.MustNavigate(url)
-	page.MustWaitDOMStable()
+	if err := page.Navigate(pageURL); err != nil {
+		return fmt.Errorf("导航失败: %w", err)
+	}
+	if err := page.WaitDOMStable(time.Second, 0.1); err != nil {
+		logrus.Warnf("WaitDOMStable: %v (继续)", err)
+	}
 	time.Sleep(1 * time.Second)
 
-	// 检测页面是否可访问
+	if err := checkCookieValid(page, feedID); err != nil {
+		return err
+	}
 	if err := checkPageAccessible(page); err != nil {
 		return err
 	}
@@ -79,195 +84,138 @@ func (f *CommentFeedAction) PostComment(ctx context.Context, feedID, xsecToken, 
 	return nil
 }
 
-// ReplyToComment 回复指定评论
+// ReplyToComment uses CDP request hijacking to inject target_comment_id into
+// the comment POST body, then verifies the result via JavaScript on the page.
 func (f *CommentFeedAction) ReplyToComment(ctx context.Context, feedID, xsecToken, commentID, userID, content string) error {
-	// 增加超时时间，因为需要滚动查找评论
-	// 注意：不使用 Context(ctx)，避免继承外部 context 的超时
-	page := f.page.Timeout(5 * time.Minute)
-	url := makeFeedDetailURL(feedID, xsecToken)
-	logrus.Infof("打开 feed 详情页进行回复: %s", url)
+	page := f.page.Timeout(90 * time.Second)
+	pageURL := makeFeedDetailURL(feedID, xsecToken)
+	logrus.Infof("打开 feed 详情页进行回复: %s", pageURL)
 
-	// 导航到详情页
-	page.MustNavigate(url)
-	page.MustWaitDOMStable()
-	time.Sleep(1 * time.Second)
+	if err := page.Navigate(pageURL); err != nil {
+		return fmt.Errorf("导航失败: %w", err)
+	}
+	if err := page.WaitDOMStable(time.Second, 0.1); err != nil {
+		logrus.Warnf("WaitDOMStable: %v (继续)", err)
+	}
+	time.Sleep(2 * time.Second)
 
-	// 检测页面是否可访问
+	if err := checkCookieValid(page, feedID); err != nil {
+		return err
+	}
 	if err := checkPageAccessible(page); err != nil {
 		return err
 	}
 
-	// 等待评论容器加载
-	time.Sleep(2 * time.Second)
+	// Install JS response capture (after page load, for reading response only)
+	page.Eval(`() => { window.__xhs_comment_resp = ''; }`)
 
-	// 使用 Go 实现的查找逻辑
-	commentEl, err := findCommentElement(page, commentID, userID)
+	logrus.Infof("设置 CDP 请求拦截，target_comment_id=%s", commentID)
+
+	intercepted := make(chan bool, 1)
+
+	router := page.HijackRequests()
+	if err := router.Add("*/api/sns/web/v1/comment/post*", "", func(hijack *rod.Hijack) {
+		defer func() {
+			if r := recover(); r != nil {
+				logrus.Errorf("CDP handler panic: %v", r)
+			}
+		}()
+
+		body := hijack.Request.Body()
+		logrus.Infof("CDP 拦截到评论请求, body=%d bytes", len(body))
+
+		var newBody []byte
+		if len(body) > 0 {
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(body), &parsed); err == nil {
+				parsed["target_comment_id"] = commentID
+				newBody, _ = json.Marshal(parsed)
+				logrus.Infof("已修改 body 注入 target_comment_id")
+			}
+		}
+
+		if len(newBody) == 0 {
+			payload := map[string]interface{}{
+				"note_id":           feedID,
+				"content":           content,
+				"target_comment_id": commentID,
+				"at_users":          []interface{}{},
+			}
+			newBody, _ = json.Marshal(payload)
+			logrus.Infof("构造新 body: %s", string(newBody))
+		}
+
+		hijack.ContinueRequest(&proto.FetchContinueRequest{
+			PostData: newBody,
+		})
+
+		select {
+		case intercepted <- true:
+		default:
+		}
+	}); err != nil {
+		return fmt.Errorf("注册拦截规则失败: %w", err)
+	}
+	go router.Run()
+	defer func() {
+		if err := router.Stop(); err != nil {
+			logrus.Warnf("停止 hijack router: %v", err)
+		}
+	}()
+
+	shortPage := page.Timeout(15 * time.Second)
+	elem, err := shortPage.Element("div.input-box div.content-edit span")
 	if err != nil {
-		return fmt.Errorf("无法找到评论: %w", err)
+		return fmt.Errorf("未找到评论输入框（xsec_token 可能已过期）: %w", err)
+	}
+	if err := elem.Click(proto.InputMouseButtonLeft, 1); err != nil {
+		return fmt.Errorf("无法点击评论输入框: %w", err)
 	}
 
-	// 滚动到评论位置
-	logrus.Info("滚动到评论位置...")
-	commentEl.MustScrollIntoView()
-	time.Sleep(1 * time.Second)
-
-	logrus.Info("准备点击回复按钮")
-
-	// 查找并点击回复按钮
-	replyBtn, err := commentEl.Element(".right .interactions .reply")
+	inputEl, err := shortPage.Element("div.input-box div.content-edit p.content-input")
 	if err != nil {
-		return fmt.Errorf("无法找到回复按钮: %w", err)
+		return fmt.Errorf("未找到评论输入区域: %w", err)
 	}
-
-	if err := replyBtn.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return fmt.Errorf("点击回复按钮失败: %w", err)
-	}
-
-	time.Sleep(1 * time.Second)
-
-	// 查找回复输入框
-	inputEl, err := page.Element("div.input-box div.content-edit p.content-input")
-	if err != nil {
-		return fmt.Errorf("无法找到回复输入框: %w", err)
-	}
-
-	// 输入内容
 	if err := inputEl.Input(content); err != nil {
 		return fmt.Errorf("输入回复内容失败: %w", err)
 	}
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 
-	// 查找并点击提交按钮
-	submitBtn, err := page.Element("div.bottom button.submit")
+	submitBtn, err := shortPage.Element("div.bottom button.submit")
 	if err != nil {
-		return fmt.Errorf("无法找到提交按钮: %w", err)
+		return fmt.Errorf("未找到提交按钮: %w", err)
 	}
-
 	if err := submitBtn.Click(proto.InputMouseButtonLeft, 1); err != nil {
 		return fmt.Errorf("点击提交按钮失败: %w", err)
 	}
 
-	time.Sleep(2 * time.Second)
-	logrus.Infof("回复评论成功")
-	return nil
-}
+	logrus.Info("已点击提交，等待 CDP 拦截...")
 
-// findCommentElement 查找指定评论元素（参考 feed_detail.go 的滚动逻辑）
-func findCommentElement(page *rod.Page, commentID, userID string) (*rod.Element, error) {
-	logrus.Infof("开始查找评论 - commentID: %s, userID: %s", commentID, userID)
-
-	const maxAttempts = 100
-	const scrollInterval = 800 * time.Millisecond
-
-	// 先滚动到评论区
-	scrollToCommentsArea(page)
-	time.Sleep(1 * time.Second)
-
-	var lastCommentCount = 0
-	stagnantChecks := 0
-
-	logrus.Infof("开始循环查找，最大尝试次数: %d", maxAttempts)
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		logrus.Infof("=== 查找尝试 %d/%d ===", attempt+1, maxAttempts)
-
-		// === 1. 检查是否到达底部 ===
-		if checkEndContainer(page) {
-			logrus.Info("已到达评论底部，未找到目标评论")
-			break
-		}
-
-		// === 2. 获取当前评论数量 ===
-		currentCount := getCommentCount(page)
-		logrus.Infof("当前评论数: %d", currentCount)
-		
-		if currentCount != lastCommentCount {
-			logrus.Infof("✓ 评论数增加: %d -> %d", lastCommentCount, currentCount)
-			lastCommentCount = currentCount
-			stagnantChecks = 0
-		} else {
-			stagnantChecks++
-			if stagnantChecks%5 == 0 {
-				logrus.Infof("评论数停滞 %d 次", stagnantChecks)
-			}
-		}
-
-		// === 3. 停滞检测 ===
-		if stagnantChecks >= 10 {
-			logrus.Info("评论数量停滞超过10次，可能已加载完所有评论")
-			break
-		}
-
-		// === 4. 先滚动到最后一个评论（触发懒加载）===
-		if currentCount > 0 {
-			logrus.Infof("滚动到最后一个评论（共 %d 条）", currentCount)
-			
-			// 使用 Go 获取所有评论元素
-			elements, err := page.Timeout(2 * time.Second).Elements(".parent-comment, .comment-item, .comment")
-			if err == nil && len(elements) > 0 {
-				// 滚动到最后一个评论
-				lastComment := elements[len(elements)-1]
-				err := lastComment.ScrollIntoView()
-				if err != nil {
-					logrus.Warnf("滚动到最后一个评论失败: %v", err)
-				}
-			} else {
-				logrus.Warnf("未找到评论元素: %v", err)
-			}
-			time.Sleep(300 * time.Millisecond)
-		}
-
-		// === 5. 继续向下滚动 ===
-		logrus.Infof("继续向下滚动...")
-		_, err := page.Eval(`() => { window.scrollBy(0, window.innerHeight * 0.8); return true; }`)
-		if err != nil {
-			logrus.Warnf("滚动失败: %v", err)
-		}
-		time.Sleep(500 * time.Millisecond)
-
-		// === 6. 滚动后立即查找（边滚动边查找）===
-		// 优先通过 commentID 查找（使用 Timeout 避免长时间等待）
-		if commentID != "" {
-			selector := fmt.Sprintf("#comment-%s", commentID)
-			logrus.Infof("尝试通过 commentID 查找: %s", selector)
-			
-			// 使用 Timeout 避免长时间等待
-			el, err := page.Timeout(2 * time.Second).Element(selector)
-			if err == nil && el != nil {
-				logrus.Infof("✓ 通过 commentID 找到评论: %s (尝试 %d 次)", commentID, attempt+1)
-				return el, nil
-			}
-			logrus.Infof("未找到 commentID (2秒超时)")
-		}
-
-		// 通过 userID 查找
-		if userID != "" {
-			logrus.Infof("尝试通过 userID 查找: %s", userID)
-			
-			// 使用 Timeout 避免长时间等待
-			elements, err := page.Timeout(2 * time.Second).Elements(".comment-item, .comment, .parent-comment")
-			if err == nil && len(elements) > 0 {
-				logrus.Infof("找到 %d 个评论元素", len(elements))
-				for i, el := range elements {
-					// 快速检查，不等待
-					userEl, err := el.Timeout(500 * time.Millisecond).Element(fmt.Sprintf(`[data-user-id="%s"]`, userID))
-					if err == nil && userEl != nil {
-						logrus.Infof("✓ 通过 userID 在第 %d 个元素中找到评论: %s (尝试 %d 次)", i+1, userID, attempt+1)
-						return el, nil
-					}
-				}
-				logrus.Infof("在 %d 个元素中未找到匹配的 userID", len(elements))
-			} else {
-				logrus.Infof("获取评论元素失败或超时: %v", err)
-			}
-		}
-		
-		logrus.Infof("本次尝试未找到目标评论，继续下一轮...")
-
-		// === 7. 等待内容加载 ===
-		time.Sleep(scrollInterval)
+	select {
+	case <-intercepted:
+		logrus.Info("CDP 已拦截并注入 target_comment_id")
+	case <-time.After(15 * time.Second):
+		return fmt.Errorf("CDP 未拦截到评论请求（15s 超时），提交可能未触发 API 调用")
 	}
 
-	return nil, fmt.Errorf("未找到评论 (commentID: %s, userID: %s), 尝试次数: %d", commentID, userID, maxAttempts)
+	// Wait for browser to complete the request
+	time.Sleep(3 * time.Second)
+
+	// Check page for error toast or success indicator
+	pageResult, _ := page.Eval(`() => {
+		var toast = document.querySelector('.toast-text, .error-text, .note-toast');
+		var newComment = document.querySelector('.comment-item:last-child .content');
+		return JSON.stringify({
+			toast: toast ? toast.textContent : '',
+			last_comment: newComment ? newComment.textContent.substring(0, 100) : '',
+			url: location.href
+		});
+	}`)
+	if pageResult != nil {
+		logrus.Infof("提交后页面状态: %s", pageResult.Value.Str())
+	}
+
+	logrus.Infof("回复评论完成 - feedID: %s, commentID: %s", feedID, commentID)
+	return nil
 }
